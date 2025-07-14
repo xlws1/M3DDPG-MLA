@@ -1,0 +1,851 @@
+from typing import Dict, Callable, List, Union, Optional
+import numpy as np
+import torch
+import torch.nn as nn  # 添加对torch.nn的导入
+import torch.nn.functional as F
+import torch.optim as optim
+import gym
+import copy
+import os
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from multiagent_wrapper import Multiagent_wrapper
+from replay_buffer import Multiagent_replay_buffer
+
+
+class VectorGradCAM:
+    """
+    Modified Grad-CAM for vector-based observations (non-image)
+    Analyzes feature importance in dense layers
+    """
+
+    def __init__(self, model: torch.nn.Module, target_layer_name: str):
+        """
+        Initialize VectorGradCAM for dense networks
+
+        Args:
+            model: PyTorch model to analyze
+            target_layer_name: Name of the target dense layer
+        """
+        self.model = model
+        self.target_layer_name = target_layer_name
+        self.gradients = None
+        self.activations = None
+        self.hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        """Register forward and backward hooks for target layer"""
+
+        def forward_hook(module, input, output):
+            self.activations = output
+
+        def backward_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0]
+
+        # Find target layer and register hooks
+        target_found = False
+        for name, module in self.model.named_modules():
+            if name == self.target_layer_name:
+                self.hooks.append(module.register_forward_hook(forward_hook))
+                self.hooks.append(module.register_backward_hook(backward_hook))
+                target_found = True
+                break
+
+        if not target_found:
+            print(f"Warning: Target layer '{self.target_layer_name}' not found. Available layers:")
+            for name, _ in self.model.named_modules():
+                print(f"  - {name}")
+            # 使用第一个Linear层作为默认
+            for name, module in self.model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    self.hooks.append(module.register_forward_hook(forward_hook))
+                    self.hooks.append(module.register_backward_hook(backward_hook))
+                    print(f"Using {name} as target layer instead")
+                    break
+
+    def generate_feature_importance(self, input_tensor: torch.Tensor,
+                                    class_idx: Optional[int] = None) -> torch.Tensor:
+        """
+        Generate feature importance for vector inputs
+
+        Args:
+            input_tensor: Input tensor for the model
+            class_idx: Target class index (for multi-dimensional outputs)
+
+        Returns:
+            Feature importance scores as tensor
+        """
+        self.model.eval()
+
+        if not input_tensor.requires_grad:
+            input_tensor.requires_grad_(True)
+
+        # Forward pass
+        output = self.model(input_tensor)
+
+        if class_idx is None:
+            if len(output.shape) > 1 and output.shape[1] > 1:
+                class_idx = output.argmax(dim=1)
+            else:
+                class_idx = 0
+
+        # Clear gradients
+        self.model.zero_grad()
+
+        # Compute class score
+        if len(output.shape) > 1 and output.shape[1] > 1:
+            if isinstance(class_idx, int):
+                class_score = output[:, class_idx]
+            else:
+                class_score = output.gather(1, class_idx.view(-1, 1)).squeeze()
+        else:
+            class_score = output.squeeze()
+
+        # Backward pass
+        if class_score.dim() == 0:
+            class_score = class_score.unsqueeze(0)
+
+        class_score.backward(torch.ones_like(class_score), retain_graph=True)
+
+        # Generate feature importance
+        if self.gradients is None or self.activations is None:
+            # Fallback to input gradients
+            return torch.abs(input_tensor.grad).detach()
+
+        # Compute feature importance
+        importance = torch.abs(self.gradients * self.activations)
+
+        # Aggregate across batch dimension if needed
+        if importance.dim() > 1:
+            importance = importance.mean(dim=0)
+
+        return importance.detach()
+
+    def cleanup(self):
+        """Remove all registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+
+class BlottoResourceConstraint:
+    """Resource allocation constraint handler for Colonel Blotto Game"""
+
+    def __init__(self, num_battlefields: int, total_resources: float = 10.0):
+        self.num_battlefields = num_battlefields
+        self.total_resources = total_resources
+
+    def apply_constraint(self, resource_allocation: torch.Tensor) -> torch.Tensor:
+        """Apply resource constraint: sum of allocations = total_resources"""
+        allocation = F.relu(resource_allocation)
+        allocation_sum = torch.sum(allocation, dim=-1, keepdim=True)
+        allocation_sum = torch.clamp(allocation_sum, min=1e-8)
+        normalized_allocation = allocation * (self.total_resources / allocation_sum)
+        return normalized_allocation
+
+    def get_allocation_penalty(self, resource_allocation: torch.Tensor) -> torch.Tensor:
+        """Compute penalty for violating resource constraints"""
+        allocation_sum = torch.sum(resource_allocation, dim=-1)
+        target_sum = torch.full_like(allocation_sum, self.total_resources)
+        penalty = F.mse_loss(allocation_sum, target_sum)
+        negative_penalty = F.relu(-resource_allocation).sum()
+        return penalty + 0.1 * negative_penalty
+
+
+class M3DDPG_Blotto:
+    """M3DDPG adapted for Colonel Blotto Game environments"""
+
+    ZERO_DIVISION_PREVENTION = 1e-8
+
+    class MultiHeadLatentAttention(nn.Module):
+        def __init__(self, embed_size, heads):
+            super(M3DDPG_Blotto.MultiHeadLatentAttention, self).__init__()
+            self.embed_size = embed_size
+            self.heads = heads
+            self.head_dim = embed_size // heads
+
+            assert self.head_dim * heads == embed_size, "Embedding size must be divisible by heads"
+
+            self.values = nn.Linear(embed_size, embed_size, bias=False)
+            self.keys = nn.Linear(embed_size, embed_size, bias=False)
+            self.queries = nn.Linear(embed_size, embed_size, bias=False)
+            self.fc_out = nn.Linear(embed_size, embed_size)
+
+        def forward(self, x):
+            N = x.shape[0]  # batch size
+            seq_length = x.shape[1]  # sequence length
+
+            values = self.values(x).view(N, seq_length, self.heads, self.head_dim)
+            keys = self.keys(x).view(N, seq_length, self.heads, self.head_dim)
+            queries = self.queries(x).view(N, seq_length, self.heads, self.head_dim)
+
+            values = values.permute(0, 2, 1, 3)
+            keys = keys.permute(0, 2, 1, 3)
+            queries = queries.permute(0, 2, 1, 3)
+
+            energy = torch.einsum("qhd,khd->qhk", [queries, keys])
+            attention = F.softmax(energy / (self.head_dim ** (1 / 2)), dim=2)
+
+            out = torch.einsum("qhk,khd->qhd", [attention, values]).reshape(N, seq_length, self.heads * self.head_dim)
+            return self.fc_out(out)
+
+    def __init__(self,
+                 env: Multiagent_wrapper,
+                 actor_models: List[torch.nn.Module],
+                 critic_models: List[torch.nn.Module],
+                 actor_learning_rates: List[float],
+                 critic_learning_rates: List[float],
+                 device: str,
+                 discounts: List[float],
+                 taus: List[float],
+                 noise_levels: List[float],
+                 noise_clips: List[float],
+                 critic_noise_levels: List[float],
+                 epsilons: List[float],
+                 alphas: List[float],
+                 max_replay_buffer_size: int,
+                 num_battlefields: int = 5,
+                 total_resources: float = 10.0,
+                 resource_constraint_weight: float = 1.0,
+                 embed_size: int = 128,  # 嵌入维度
+                 heads: int = 8,  # 注意力头数
+                 burnin_steps: int = 10000,
+                 burnin_policies: Optional[List[Callable[[np.ndarray], np.ndarray]]] = None,
+                 update_target_nets_frequency: int = 2,
+                 batch_size: int = 64,
+                 enable_attention_analysis: bool = True,
+                 target_layer_name: str = 'fc1') -> None:
+
+        self.env = env
+        self.device = device
+        self.dtype = torch.float32
+
+        # Blotto Game specific
+        self.num_battlefields = num_battlefields
+        self.total_resources = total_resources
+        self.resource_constraint_weight = resource_constraint_weight
+        self.resource_constraint = BlottoResourceConstraint(num_battlefields, total_resources)
+
+        # Hyperparameters
+        self.discounts = discounts
+        self.taus = taus
+        self.noise_levels = noise_levels
+        self.noise_clips = noise_clips
+        self.critic_noise_levels = critic_noise_levels
+        self.epsilons = epsilons
+        self.alphas = alphas
+        self.batch_size = batch_size
+        self.update_target_nets_frequency = update_target_nets_frequency
+        self.burnin_steps = burnin_steps
+
+        # Environment properties
+        self.state_shape = env.state_space.shape
+        self.action_shapes = [action_space.shape for action_space in env.action_spaces]
+        self.observation_shapes = [observation_space.shape for observation_space in env.observation_spaces]
+        self.num_agents = env.num_agents
+
+        # Action space bounds
+        self.action_highs = [self._numpy_to_tensor(action_space.high) for action_space in env.action_spaces]
+        self.action_lows = [self._numpy_to_tensor(action_space.low) for action_space in env.action_spaces]
+
+        # Split action dimensions
+        self.physical_action_dims = []
+        self.resource_action_dims = []
+
+        for action_shape in self.action_shapes:
+            total_action_dim = action_shape[0]
+            physical_dim = total_action_dim - num_battlefields
+            self.physical_action_dims.append(physical_dim)
+            self.resource_action_dims.append(num_battlefields)
+
+        # Burnin policies with resource constraints
+        self.burnin_policies = burnin_policies
+        if self.burnin_policies is None:
+            self.burnin_policies = []
+            for i, action_space in enumerate(self.env.action_spaces):
+                self.burnin_policies.append(self._create_blotto_burnin_policy(i, action_space))
+
+        # Initialize networks and optimizers
+        self.actors, self.critics = [], []
+        self.target_actors, self.target_critics = [], []
+        self.actor_optimizers, self.critic_optimizers = [], []
+
+        for i in range(self.num_agents):
+            # Main networks
+            self.actors.append(actor_models[i].train().to(self.device))
+            self.critics.append(critic_models[i].train().to(self.device))
+
+            # Target networks
+            self.target_actors.append(copy.deepcopy(actor_models[i]).eval().to(self.device))
+            self.target_critics.append(copy.deepcopy(critic_models[i]).eval().to(self.device))
+
+            # Optimizers
+            self.actor_optimizers.append(optim.Adam(self.actors[i].parameters(), lr=actor_learning_rates[i]))
+            self.critic_optimizers.append(optim.Adam(self.critics[i].parameters(), lr=critic_learning_rates[i]))
+
+        # Replay buffer
+        self.replay_buffer = Multiagent_replay_buffer(
+            self.state_shape,
+            self.observation_shapes,
+            self.action_shapes,
+            self.num_agents,
+            self.device,
+            max_size=max_replay_buffer_size,
+            dtype=self.dtype
+        )
+
+        # Loss function
+        self.loss = torch.nn.MSELoss()
+
+        # Training state
+        self.total_iterations = 0
+        self.total_train_steps = 0
+        self.env_done = True
+        self.env_observations = None
+        self.env_state = None
+        self.rewards_history = np.zeros((1, self.env.num_agents))
+        self.episode_rewards = np.zeros(self.env.num_agents)
+
+        # Attention analysis
+        self.enable_attention_analysis = enable_attention_analysis
+        self.actor_attention_analyzers = []
+
+        if self.enable_attention_analysis:
+            try:
+                self.attention_layer = self.MultiHeadLatentAttention(embed_size, heads).to(self.device)
+            except Exception as e:
+                print(f"Warning: Could not initialize attention analysis: {e}")
+                self.enable_attention_analysis = False
+
+        # Blotto-specific metrics
+        self.resource_constraint_violations = []
+        self.battlefield_win_rates = [[] for _ in range(self.num_agents)]
+
+    def _create_blotto_burnin_policy(self, agent_id: int, action_space) -> Callable:
+        """Create burnin policy that respects resource constraints"""
+        def blotto_burnin_policy(obs: np.ndarray) -> np.ndarray:
+            full_action = action_space.sample()
+            physical_dim = self.physical_action_dims[agent_id]
+            resource_allocation = np.random.uniform(0, 1, self.num_battlefields)
+            resource_allocation = resource_allocation / np.sum(resource_allocation) * self.total_resources
+            full_action[physical_dim:] = resource_allocation * 2 - self.total_resources
+            return full_action
+        return blotto_burnin_policy
+
+    def _split_action(self, action: torch.Tensor, agent_id: int) -> tuple:
+        """Split action into physical and resource components"""
+        physical_dim = self.physical_action_dims[agent_id]
+        physical_action = action[:, :physical_dim] if action.dim() > 1 else action[:physical_dim]
+        resource_action = action[:, physical_dim:] if action.dim() > 1 else action[physical_dim:]
+        return physical_action, resource_action
+
+    def _combine_action(self, physical_action: torch.Tensor, resource_action: torch.Tensor) -> torch.Tensor:
+        """Combine physical and resource actions"""
+        return torch.cat([physical_action, resource_action], dim=-1)
+
+    def _process_resource_allocation(self, resource_action: torch.Tensor) -> torch.Tensor:
+        """Process raw resource action to valid allocation"""
+        raw_allocation = (resource_action + 1.0) * self.total_resources / 2.0
+        valid_allocation = self.resource_constraint.apply_constraint(raw_allocation)
+        return valid_allocation
+
+    def train(self, num_train_steps: int) -> np.ndarray:
+        """Train models for specified number of steps"""
+        if self.env_done:
+            self.env_state, self.env_observations = self.env.reset()
+            self.env_done = False
+
+        iteration_steps = max(self.total_iterations, self.burnin_steps) - self.total_iterations + num_train_steps
+
+        for _ in tqdm(range(iteration_steps), desc="Training Blotto M3DDPG"):
+            self.total_iterations += 1
+
+            if self.env_done:
+                self.env_state, self.env_observations = self.env.reset()
+                self.rewards_history = np.append(
+                    self.rewards_history,
+                    self.episode_rewards.reshape((1, -1)),
+                    axis=0
+                )
+                self.episode_rewards = np.zeros(self.env.num_agents)
+
+            # Select actions with resource constraints
+            actions = []
+            for actor_id in range(self.env.num_agents):
+                with torch.no_grad():
+                    actions.append(self._select_blotto_action(actor_id, self.env_observations[actor_id]))
+
+            # Environment step
+            next_state, new_observations, rewards, self.env_done, info = self.env.step(actions)
+
+            # Store transition
+            self.replay_buffer.add_transition(
+                self.env_state, next_state, self.env_observations,
+                actions, rewards, new_observations, self.env_done
+            )
+
+            # Update episode rewards
+            self.episode_rewards = np.sum([self.episode_rewards, rewards], axis=0)
+
+            # Track Blotto-specific metrics
+            if 'battlefield_winners' in info:
+                for agent_id in range(self.num_agents):
+                    wins = np.sum(info['battlefield_winners'] == (1 if agent_id == 0 else -1))
+                    self.battlefield_win_rates[agent_id].append(wins / self.num_battlefields)
+
+            # Update environment state
+            self.env_observations = new_observations
+            self.env_state = next_state
+
+            # Training updates
+            if self.burnin_steps < self.total_iterations:
+                self.total_train_steps += 1
+
+                # Sample batch
+                (states_batch, next_states_batch, observations_batch,
+                 actions_batch, rewards_batch, next_observations_batch,
+                 done_batch) = self.replay_buffer.sample(self.batch_size)
+
+                # Update critics with resource constraints
+                self._update_critics_blotto(
+                    states_batch, next_states_batch, actions_batch,
+                    rewards_batch, next_observations_batch, done_batch
+                )
+
+                # Update actors and target networks
+                if self.total_train_steps % self.update_target_nets_frequency == 0:
+                    self._update_actors_blotto(states_batch, observations_batch, actions_batch)
+                    self._update_target_nets()
+
+        return self.rewards_history
+
+    def _update_critics_blotto(self, states_batch, next_states_batch, actions_batch,
+                               rewards_batch, next_observations_batch, done_batch):
+        """Update critic networks with resource constraint awareness"""
+        with torch.no_grad():
+            next_actions_batch = []
+            for i, target_actor in enumerate(self.target_actors):
+                next_action = target_actor(next_observations_batch[i])
+                physical_action, resource_action = self._split_action(next_action, i)
+                valid_resource_action = self._process_resource_allocation(resource_action)
+                valid_resource_action = (valid_resource_action / self.total_resources) * 2.0 - 1.0
+                constrained_action = self._combine_action(physical_action, valid_resource_action)
+                next_actions_batch.append(constrained_action)
+
+        for i, critic in enumerate(self.critics):
+            if self.alphas[i] > 0.:
+                adversarial_next_actions = self._get_adversarial_blotto_actions(
+                    next_states_batch, next_actions_batch, self.target_critics[i], i
+                )
+            else:
+                adversarial_next_actions = next_actions_batch
+
+            adversarial_next_actions[i] = next_actions_batch[i]
+
+            adversarial_next_actions = [
+                self._add_noise_to_blotto_action(action, j)
+                for j, action in enumerate(adversarial_next_actions)
+            ]
+
+            with torch.no_grad():
+                next_q_values = self.target_critics[i](next_states_batch, adversarial_next_actions)
+                q_targets = (rewards_batch[i] +
+                             (1. - done_batch) * self.discounts[i] * next_q_values).detach()
+
+            q_values = critic(states_batch, actions_batch)
+
+            resource_penalty = 0.0
+            if self.resource_constraint_weight > 0:
+                _, resource_action = self._split_action(actions_batch[i], i)
+                processed_resources = self._process_resource_allocation(resource_action)
+                resource_penalty = self.resource_constraint.get_allocation_penalty(processed_resources)
+
+            self.critic_optimizers[i].zero_grad()
+            critic_loss = self.loss(q_values, q_targets) + self.resource_constraint_weight * resource_penalty
+            critic_loss.backward()
+            self.critic_optimizers[i].step()
+
+    def _update_actors_blotto(self, states_batch, observations_batch, actions_batch):
+        """Update actor networks with Blotto game considerations"""
+        for i, actor in enumerate(self.actors):
+            raw_actions = actor(observations_batch[i])
+            physical_action, resource_action = self._split_action(raw_actions, i)
+            valid_resource_action = self._process_resource_allocation(resource_action)
+            valid_resource_action = (valid_resource_action / self.total_resources) * 2.0 - 1.0
+            actions = self._combine_action(physical_action, valid_resource_action)
+
+            joint_actions = copy.deepcopy(actions_batch)
+
+            if self.alphas[i] > 0.:
+                adversarial_joint_actions = self._get_adversarial_blotto_actions(
+                    states_batch, joint_actions, self.critics[i], i
+                )
+            else:
+                adversarial_joint_actions = joint_actions
+
+            adversarial_joint_actions[i] = actions
+
+            resource_penalty = 0.0
+            if self.resource_constraint_weight > 0:
+                _, current_resource_action = self._split_action(actions, i)
+                processed_resources = self._process_resource_allocation(current_resource_action)
+                resource_penalty = self.resource_constraint.get_allocation_penalty(processed_resources)
+
+            self.actor_optimizers[i].zero_grad()
+            actor_loss = (-self.critics[i](states_batch, adversarial_joint_actions).mean() +
+                          self.resource_constraint_weight * resource_penalty)
+            actor_loss.backward()
+            self.actor_optimizers[i].step()
+
+    def _get_adversarial_blotto_actions(self, states, actions, critic, own_agent_id):
+        """Generate adversarial actions specific to Blotto game dynamics"""
+        actions = [action.requires_grad_(True) for action in actions]
+        actor_gain = critic(states, actions).mean()
+        actor_gain.backward()
+
+        adversarial_actions = []
+        with torch.no_grad():
+            for i, action in enumerate(actions):
+                if i == own_agent_id:
+                    adversarial_actions.append(action.detach())
+                    continue
+
+                action_gradient = action.grad
+                gradient_norm = torch.linalg.norm(action_gradient, dim=1, keepdim=True)
+                action_norm = torch.linalg.norm(action, dim=1, keepdim=True)
+
+                perturbation = -self.alphas[own_agent_id] * action_norm * (
+                        action_gradient / (gradient_norm + self.ZERO_DIVISION_PREVENTION)
+                )
+
+                adversarial_action = torch.max(
+                    torch.min(action + perturbation, self.action_highs[i]),
+                    self.action_lows[i]
+                ).detach()
+
+                physical_adv, resource_adv = self._split_action(adversarial_action, i)
+                valid_resource_adv = self._process_resource_allocation(resource_adv)
+                valid_resource_adv = (valid_resource_adv / self.total_resources) * 2.0 - 1.0
+                constrained_adversarial = self._combine_action(physical_adv, valid_resource_adv)
+
+                adversarial_actions.append(constrained_adversarial)
+
+        return adversarial_actions
+
+    def _add_noise_to_blotto_action(self, action: torch.Tensor, agent_id: int) -> torch.Tensor:
+        """Add noise while preserving resource constraints"""
+        physical_action, resource_action = self._split_action(action, agent_id)
+
+        physical_noise = (torch.randn_like(physical_action) * self.noise_levels[agent_id]).clip(
+            -self.noise_clips[agent_id], self.noise_clips[agent_id]
+        )
+        noisy_physical = torch.max(
+            torch.min(physical_action + physical_noise,
+                      self.action_highs[agent_id][:self.physical_action_dims[agent_id]]),
+            self.action_lows[agent_id][:self.physical_action_dims[agent_id]]
+        )
+
+        resource_noise = torch.randn_like(resource_action) * 0.1
+        noisy_resource = resource_action + resource_noise
+
+        valid_noisy_resource = self._process_resource_allocation(noisy_resource)
+        valid_noisy_resource = (valid_noisy_resource / self.total_resources) * 2.0 - 1.0
+
+        return self._combine_action(noisy_physical, valid_noisy_resource)
+
+    def _select_blotto_action(self, actor_id: int, observation: np.ndarray) -> np.ndarray:
+        """Select action with resource allocation constraints"""
+        if self.burnin_steps >= self.total_iterations:
+            action = self.burnin_policies[actor_id](observation)
+        elif np.random.uniform() <= self.epsilons[actor_id]:
+            raw_action = self.env.action_spaces[actor_id].sample()
+            action = self._apply_resource_constraints_to_numpy_action(raw_action, actor_id)
+        else:
+            torch_observation = self._numpy_to_tensor(observation).unsqueeze(0)
+            self.actors[actor_id].eval()
+            with torch.no_grad():
+                raw_action = self.actors[actor_id](torch_observation).squeeze(dim=0)
+            self.actors[actor_id].train()
+
+            physical_action, resource_action = self._split_action(raw_action, actor_id)
+            valid_resource_action = self._process_resource_allocation(resource_action.unsqueeze(0)).squeeze(0)
+            valid_resource_action = (valid_resource_action / self.total_resources) * 2.0 - 1.0
+
+            constrained_action = self._combine_action(physical_action, valid_resource_action)
+            constrained_action = self._add_noise_to_blotto_action(constrained_action, actor_id)
+            action = self._tensor_to_numpy(constrained_action)
+
+        return action
+
+    def _apply_resource_constraints_to_numpy_action(self, action: np.ndarray, agent_id: int) -> np.ndarray:
+        """Apply resource constraints to numpy action"""
+        physical_dim = self.physical_action_dims[agent_id]
+        constrained_action = action.copy()
+        resource_part = action[physical_dim:]
+        raw_allocation = (resource_part + 1.0) * self.total_resources / 2.0
+        allocation_sum = np.sum(raw_allocation)
+        if allocation_sum > 0:
+            valid_allocation = raw_allocation * self.total_resources / allocation_sum
+        else:
+            valid_allocation = np.ones(self.num_battlefields) * self.total_resources / self.num_battlefields
+
+        valid_resource_action = (valid_allocation / self.total_resources) * 2.0 - 1.0
+        constrained_action[physical_dim:] = valid_resource_action
+
+        return constrained_action
+
+    # === Attention Analysis Methods ===
+    def analyze_feature_importance(self, agent_id: int, observation: np.ndarray,
+                                   network_type: str = 'actor') -> np.ndarray:
+        """Analyze feature importance for decision making"""
+        if not self.enable_attention_analysis:
+            raise RuntimeError("Attention analysis is not enabled")
+
+        observation_tensor = self._numpy_to_tensor(observation).unsqueeze(0)
+
+        try:
+            if network_type == 'actor':
+                analyzer = self.actor_attention_analyzers[agent_id]
+            else:
+                analyzer = self.critic_attention_analyzers[agent_id]
+
+            with torch.enable_grad():
+                importance = analyzer.generate_feature_importance(observation_tensor)
+            return importance.cpu().numpy()
+        except Exception as e:
+            print(f"Error analyzing feature importance for agent {agent_id}: {e}")
+            return np.zeros(observation.shape)
+
+    def visualize_resource_allocation_attention(self, agent_id: int, observation: np.ndarray,
+                                                save_path: Optional[str] = None):
+        """Visualize which observation features influence resource allocation decisions"""
+        if not self.enable_attention_analysis:
+            print("Attention analysis is not enabled")
+            return
+
+        try:
+            importance = self.analyze_feature_importance(agent_id, observation, 'actor')
+
+            # Create visualization
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+            # Observation features
+            axes[0, 0].bar(range(len(observation)), observation)
+            axes[0, 0].set_title(f'Agent {agent_id} - Observation Features')
+            axes[0, 0].set_xlabel('Feature Index')
+            axes[0, 0].set_ylabel('Feature Value')
+
+            # Feature importance
+            if len(importance.shape) > 1:
+                importance = importance.flatten()
+            axes[0, 1].bar(range(len(importance)), importance)
+            axes[0, 1].set_title(f'Agent {agent_id} - Feature Importance')
+            axes[0, 1].set_xlabel('Feature Index')
+            axes[0, 1].set_ylabel('Importance Score')
+
+            # Combined view (observation weighted by importance)
+            if len(importance) == len(observation):
+                weighted_features = observation * importance[:len(observation)]
+                axes[1, 0].bar(range(len(weighted_features)), weighted_features)
+                axes[1, 0].set_title(f'Agent {agent_id} - Weighted Features')
+                axes[1, 0].set_xlabel('Feature Index')
+                axes[1, 0].set_ylabel('Weighted Value')
+
+            # Current resource allocation
+            torch_obs = self._numpy_to_tensor(observation).unsqueeze(0)
+            with torch.no_grad():
+                action = self.actors[agent_id](torch_obs).squeeze()
+                _, resource_action = self._split_action(action, agent_id)
+                resource_allocation = self._process_resource_allocation(resource_action.unsqueeze(0)).squeeze()
+
+            axes[1, 1].bar(range(self.num_battlefields), resource_allocation.cpu().numpy())
+            axes[1, 1].set_title(f'Agent {agent_id} - Resource Allocation')
+            axes[1, 1].set_xlabel('Battlefield')
+            axes[1, 1].set_ylabel('Allocated Resources')
+            axes[1, 1].set_ylim(0, self.total_resources)
+
+            plt.tight_layout()
+
+            if save_path:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            print(f"Error visualizing resource allocation attention for agent {agent_id}: {e}")
+
+    def compare_resource_strategies(self, observations: List[np.ndarray],
+                                    save_path: Optional[str] = None):
+        """Compare resource allocation strategies across agents"""
+        try:
+            fig, axes = plt.subplots(2, self.num_agents, figsize=(5 * self.num_agents, 10))
+            if self.num_agents == 1:
+                axes = axes.reshape(2, 1)
+
+            for agent_id in range(self.num_agents):
+                torch_obs = self._numpy_to_tensor(observations[agent_id]).unsqueeze(0)
+                with torch.no_grad():
+                    action = self.actors[agent_id](torch_obs).squeeze()
+                    _, resource_action = self._split_action(action, agent_id)
+                    resource_allocation = self._process_resource_allocation(resource_action.unsqueeze(0)).squeeze()
+
+                # Resource allocation
+                axes[0, agent_id].bar(range(self.num_battlefields),
+                                      resource_allocation.cpu().numpy())
+                axes[0, agent_id].set_title(f'Agent {agent_id} - Resource Allocation')
+                axes[0, agent_id].set_xlabel('Battlefield')
+                axes[0, agent_id].set_ylabel('Allocated Resources')
+                axes[0, agent_id].set_ylim(0, self.total_resources)
+
+                # Feature importance for resource decisions
+                if self.enable_attention_analysis:
+                    importance = self.analyze_feature_importance(agent_id, observations[agent_id], 'actor')
+                    if len(importance.shape) > 1:
+                        importance = importance.flatten()
+
+                    axes[1, agent_id].bar(range(len(importance)), importance)
+                    axes[1, agent_id].set_title(f'Agent {agent_id} - Decision Importance')
+                    axes[1, agent_id].set_xlabel('Feature Index')
+                    axes[1, agent_id].set_ylabel('Importance Score')
+
+            plt.tight_layout()
+
+            if save_path:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            print(f"Error comparing resource strategies: {e}")
+
+    def get_blotto_metrics(self) -> Dict:
+        """Get Blotto-specific training metrics"""
+        metrics = {
+            'resource_constraint_violations': np.mean(
+                self.resource_constraint_violations) if self.resource_constraint_violations else 0,
+            'battlefield_win_rates': [np.mean(rates) if rates else 0 for rates in self.battlefield_win_rates],
+            'total_episodes': len(self.rewards_history),
+            'average_episode_rewards': np.mean(self.rewards_history, axis=0) if len(
+                self.rewards_history) > 1 else np.zeros(self.num_agents)
+        }
+        return metrics
+
+    def print_blotto_summary(self):
+        """Print training summary with Blotto-specific information"""
+        metrics = self.get_blotto_metrics()
+        print("\n" + "=" * 50)
+        print("BLOTTO M3DDPG TRAINING SUMMARY")
+        print("=" * 50)
+        print(f"Total Training Steps: {self.total_train_steps}")
+        print(f"Total Episodes: {metrics['total_episodes']}")
+        print(f"Resource Constraint Violations: {metrics['resource_constraint_violations']:.4f}")
+
+        for agent_id in range(self.num_agents):
+            print(f"\nAgent {agent_id}:")
+            print(f"  Average Episode Reward: {metrics['average_episode_rewards'][agent_id]:.2f}")
+            print(f"  Battlefield Win Rate: {metrics['battlefield_win_rates'][agent_id]:.2f}")
+        print("=" * 50)
+
+    def _update_target_nets(self):
+        """Update target networks using soft updates"""
+        for i in range(self.num_agents):
+            self._update_target_net(self.target_actors[i], self.actors[i], self.taus[i])
+            self._update_target_net(self.target_critics[i], self.critics[i], self.taus[i])
+
+    def _update_target_net(self, target_net, true_net, tau):
+        """Soft update of target network parameters"""
+        for target_params, true_params in zip(target_net.parameters(), true_net.parameters()):
+            target_params.data.copy_(
+                target_params.data * (1.0 - tau) + true_params.data * tau
+            )
+
+    def get_policy(self, actor_id: int) -> Callable[[np.ndarray], np.ndarray]:
+        """Get policy function for specific agent with resource constraints"""
+        policy = copy.deepcopy(self.actors[actor_id]).eval().cpu()
+        agent_id_copy = actor_id  # Capture for closure
+
+        def act(obs: np.ndarray) -> np.ndarray:
+            with torch.no_grad():
+                tensor_obs = torch.tensor(obs, dtype=self.dtype, requires_grad=False).unsqueeze(0)
+                raw_action = policy(tensor_obs).squeeze(dim=0)
+
+                physical_dim = self.physical_action_dims[agent_id_copy]
+                physical_action = raw_action[:physical_dim]
+                resource_action = raw_action[physical_dim:]
+
+                raw_allocation = (resource_action + 1.0) * self.total_resources / 2.0
+                allocation_sum = torch.sum(raw_allocation)
+                if allocation_sum > 0:
+                    valid_allocation = raw_allocation * self.total_resources / allocation_sum
+                else:
+                    valid_allocation = torch.ones(self.num_battlefields) * self.total_resources / self.num_battlefields
+
+                valid_resource_action = (valid_allocation / self.total_resources) * 2.0 - 1.0
+
+                action = torch.cat([physical_action, valid_resource_action])
+
+            return action.numpy()
+
+        return act
+
+    def cleanup(self):
+        """Clean up resources including attention analysis hooks"""
+        if self.enable_attention_analysis:
+            for analyzer in self.actor_attention_analyzers:
+                analyzer.cleanup()
+
+    def _numpy_to_tensor(self, np_array: np.ndarray) -> torch.Tensor:
+        """Convert numpy array to torch tensor"""
+        return torch.tensor(np_array, dtype=self.dtype, device=self.device, requires_grad=False)
+
+    def _tensor_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
+        """Convert torch tensor to numpy array"""
+        return tensor.detach().cpu().numpy()
+
+    def save_status(self, dir_path: str, prefix: str = "M3DDPG_Blotto") -> None:
+        """Save training status"""
+        os.makedirs(dir_path, exist_ok=True)
+
+        for i in range(self.num_agents):
+            actor_file = f'{prefix}_actor{i}_{self.total_iterations}its.pt'
+            critic_file = f'{prefix}_critic{i}_{self.total_iterations}its.pt'
+            actor_opt_file = f'{prefix}_actor{i}_optimizer_{self.total_iterations}its.pt'
+            critic_opt_file = f'{prefix}_critic{i}_optimizer_{self.total_iterations}its.pt'
+
+            self.save_model(self.actors[i], dir_path, actor_file)
+            self.save_model(self.critics[i], dir_path, critic_file)
+            self.save_model(self.actor_optimizers[i], dir_path, actor_opt_file)
+            self.save_model(self.critic_optimizers[i], dir_path, critic_opt_file)
+
+    def load_status(self, dir_path: str, actor_file_names: List[str],
+                    critic_file_names: List[str], actor_optimizer_file_names: List[str],
+                    critic_optimizer_file_names: List[str]) -> None:
+        """Load training status from saved files"""
+        for i in range(self.num_agents):
+            self.load_model(self.actors[i], dir_path, actor_file_names[i])
+            self.load_model(self.critics[i], dir_path, critic_file_names[i])
+
+            self.target_actors[i] = copy.deepcopy(self.actors[i]).eval().to(self.device)
+            self.target_critics[i] = copy.deepcopy(self.critics[i]).eval().to(self.device)
+
+            self.load_model(self.actor_optimizers[i], dir_path, actor_optimizer_file_names[i])
+            self.load_model(self.critic_optimizers[i], dir_path, critic_optimizer_file_names[i])
+
+    def save_model(self, model: Union[torch.nn.Module, optim.Optimizer],
+                   path: str, filename: str) -> None:
+        """Save individual model or optimizer"""
+        save_path = os.path.join(path, filename)
+        torch.save(model.state_dict(), save_path)
+
+    def load_model(self, model: Union[torch.nn.Module, optim.Optimizer],
+                   path: str, filename: str):
+        """Load individual model or optimizer"""
+        load_path = os.path.join(path, filename)
+        model.load_state_dict(torch.load(load_path, map_location=self.device))
+
+
+def _map_function_arg_pairs(function_list, arg):
+    """Map list of functions to list of arguments"""
+    return map(lambda func, arg: func(arg), function_list, arg)
