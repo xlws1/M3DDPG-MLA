@@ -7,7 +7,7 @@ This repository contains the code for the paper:
 
 ## Overview
 
-M3DDPG-MLA extends the standard M3DDPG algorithm [[1]](#1) by integrating:
+M3DDPG-MLA extends the standard M3DDPG algorithm by integrating:
 - **Multi-Head Latent Attention (MLA)** mechanism for cognitive perception of jamming threats
 - **Action-grounded Grad-CAM** visualization for explainable decision-making
 - **Hybrid game-theoretic formulation** combining Colonel Blotto Game with continuous 2D physical environment
